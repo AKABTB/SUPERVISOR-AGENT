@@ -1,0 +1,14 @@
+# 监督助手 依赖
+# 步骤0：先只放骨架必需的。LLM/TG 各家 SDK 在对应步骤再加。
+
+python-telegram-bot[job-queue]==21.9   # TG Bot + JobQueue 定时催收
+PyYAML==6.0.2                          # config.yaml 读取
+python-dotenv==1.0.1                   # .env 密钥加载
+
+# LLM SDK（步骤1按所选家启用；先全列，装哪个用哪个）
+anthropic==0.42.0        # Claude
+openai==1.59.6           # OpenAI / DeepSeek(兼容 openai 接口)
+
+# Web 控制台（SPEC 第9节·清醒管理者面板）
+fastapi==0.115.6         # REST API
+uvicorn[standard]==0.34.0  # ASGI 服务器
