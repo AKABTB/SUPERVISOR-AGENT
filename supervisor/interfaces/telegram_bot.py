@@ -19,6 +19,7 @@ from telegram.ext import (
 )
 
 from ..config import Config
+from ..core.goal_parser import parse_goal_nl
 from ..core.intent import is_change_goal_intent
 from ..core.project_manager import ProjectManager
 from ..core.reviewer import Reviewer
@@ -38,7 +39,7 @@ _PENDING_KEY = "pending_cmd"
 
 # 每个待补参数命令的 ForceReply 提示文案（贴催收调性）。
 _PROMPTS = {
-    "goal": "定啥？一行给全：目标 | 频率\n例：写完登录页 | 每天20:00\n（频率不写默认每天20:00）",
+    "goal": "定啥？说人话：做什么 + 多久催你一次。\n例：我要每天晚上八点前交健身打卡。\n要拆步骤：重构登录，先写接口再接前端最后联调。\n（老格式也认：写完登录页 | 每天20:00）",
     "primary": "换哪个当主攻？发编号。/list 里的 # 后面那个数。",
     "done": "交掉哪个？发编号。",
     "change": "主攻改成啥？发新的目标定义。这是改目标唯一正门。",
@@ -47,7 +48,7 @@ _PROMPTS = {
 # 命令菜单：让 TG 客户端显示 / 补全列表。描述贴催收人设，和 /start 文案一致。
 # 顺序 = 菜单里的展示顺序，把最常用的放前面。
 _COMMANDS = [
-    BotCommand("goal", "定个目标 | 频率，例：写完登录页 | 每天20:00"),
+    BotCommand("goal", "定个目标，说人话即可，例：每天晚上八点前交健身打卡"),
     BotCommand("list", "看所有目标"),
     BotCommand("primary", "换当下主攻，用法：编号"),
     BotCommand("done", "交掉一个，别拖，用法：编号"),
@@ -70,9 +71,10 @@ class SupervisorBot:
         self._pm = ProjectManager(self._db)
         self._llm = build_llm(cfg.llm)
         self._reviewer = Reviewer(self._db, self._llm)
-        # 当前已挂催收 job 的"指纹"= (主攻id, cadence原文)。看门狗拿它跟库对比，
-        # 不一致说明别处（Web/其他）改了主攻或频率 → 重挂。None 表示当前没挂催收。
-        self._nag_fingerprint: tuple[int, str] | None = None
+        # 当前已挂催收 job 的"指纹"= (主攻id, cadence原文, 活跃子目标id)。看门狗拿它跟库
+        # 对比，不一致说明别处（Web/其他）改了主攻/频率、或活跃子目标推进了 → 重挂。
+        # None 表示当前没挂催收。
+        self._nag_fingerprint: tuple[int, str, int | None] | None = None
         self._app = self._build_app(cfg)
         self._register()
 
@@ -123,14 +125,21 @@ class SupervisorBot:
         logger.info("催收自校看门狗已挂：每 %d 秒重读库一次。", _WATCH_INTERVAL)
 
     async def _watch_callback(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """自校：当前库里的主攻(id, cadence)若和已挂 job 的指纹不一致，就重挂。
-        这样在 Web 或别处改了主攻/频率，Bot 无需重启也会自动跟上。"""
-        primary = self._pm.get_primary()
-        current = (primary.id, primary.cadence) if primary else None
+        """自校：当前库里的主攻(id, cadence, 活跃子目标id)若和已挂 job 的指纹不一致，就重挂。
+        这样在 Web 或别处改了主攻/频率、或活跃子目标推进了，Bot 无需重启也会自动跟上。"""
+        current = self._current_fingerprint()
         if current != self._nag_fingerprint:
             logger.info("自校发现变动：%s → %s，重挂催收。",
                         self._nag_fingerprint, current)
             self._reschedule_primary(ctx.application)
+
+    def _current_fingerprint(self) -> tuple[int, str, int | None] | None:
+        """当前库状态的催收指纹。活跃子目标推进也会变，触发看门狗重挂。"""
+        target = self._pm.get_nag_target()
+        if target is None:
+            return None
+        primary, active_child = target
+        return (primary.id, primary.cadence, active_child.id if active_child else None)
 
     # ---- 催收调度 ----
 
@@ -159,17 +168,18 @@ class SupervisorBot:
                 self._nag_callback, interval=sched.seconds, first=sched.seconds,
                 name=_NAG_JOB, chat_id=self._owner_id, data=data,
             )
-        # 记下这次挂的是什么，供看门狗对比
-        self._nag_fingerprint = (primary.id, primary.cadence)
+        # 记下这次挂的是什么，供看门狗对比（含活跃子目标 id）
+        self._nag_fingerprint = self._current_fingerprint()
         logger.info("催收已挂：目标[%s] 频率=%s", primary.id, desc)
 
     async def _nag_callback(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """到点主动催收 —— 这是'官'落地、你躲不掉的那一刻。"""
-        primary = self._pm.get_primary()
-        if not primary:
+        """到点主动催收 —— 这是'官'落地、你躲不掉的那一刻。催词精确到活跃子目标。"""
+        target = self._pm.get_nag_target()
+        if target is None:
             return
+        primary, active_child = target
         await ctx.bot.send_message(
-            chat_id=ctx.job.chat_id, text=self._pm.nag_text(primary)
+            chat_id=ctx.job.chat_id, text=self._pm.nag_text(primary, active_child)
         )
 
     # ---- 命令 ----
@@ -188,13 +198,14 @@ class SupervisorBot:
         await update.message.reply_text(
             "我在。我不是来陪你聊的，是来盯你交货的。\n\n"
             "定目标（走命令，不许在这跟我聊怎么定）：\n"
-            "  /goal 目标 | 频率      例：/goal 写完登录页 | 每天20:00\n"
+            "  /goal 说人话           例：/goal 每天晚上八点前交健身打卡\n"
+            "                         拆步骤：/goal 重构登录，先写接口再接前端最后联调\n"
             "  /primary 编号          换当下主攻\n"
             "  /list                  看所有目标\n"
-            "  /done 编号             交掉一个\n"
+            "  /done 编号             交掉一个（或交掉当前子步骤）\n"
             "  /nagnow                立刻催我一次（测试用）\n\n"
-            "频率写法：每天20:00 / 每2小时 / 每30分钟。\n"
-            "只对主攻目标催收，其他排队。"
+            "频率写法：每天20:00 / 每天晚上八点 / 每2小时 / 每30分钟。\n"
+            "只对主攻目标催收，其他排队；拆了步骤只催当前那一步。"
         )
 
     async def _on_whoami(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -210,22 +221,60 @@ class SupervisorBot:
         await self._do_goal(update, ctx, raw)
 
     async def _do_goal(self, update, ctx, raw: str) -> None:
-        title, cadence = _split_goal(raw)
-        if not title:
+        raw = raw.strip()
+        if not raw:
+            await self._goal_format_hint(update)
+            return
+
+        # 含竖线 = 用户明确用了老格式 → 直接切，不劳 LLM。
+        if "|" in raw or "｜" in raw:
+            title, cadence = _split_goal(raw)
+            if not title:
+                await self._goal_format_hint(update)
+                return
+            goal, is_primary = self._pm.add_goal(title, cadence)
+            await self._announce_goal(update, ctx, goal, [], is_primary)
+            return
+
+        # 否则当自然语言：送 LLM 解析出 标题/频率/截止/子目标。
+        parsed = await _run_parse(self._llm, raw)
+        if not parsed.confident:
+            # 拆不准 —— 反问确认，绝不瞎猜落库（守灵魂：不帮你想目标）。
+            ctx.user_data[_PENDING_KEY] = "goal"
             await update.message.reply_text(
-                "格式：目标 | 频率\n"
-                "例：写完登录页 | 每天20:00\n"
-                "分隔符 | 打不出也行，直接 写完登录页 每天20:00 也认。\n"
-                "目标要小到今天就能出体。"
+                "没听清你到底要交什么东西。一句话说清「做什么 + 多久催你一次」。\n"
+                "例：我要每天晚上八点前交健身打卡。\n"
+                "要拆步骤就直说：重构登录，先写接口再接前端最后联调。",
+                reply_markup=ForceReply(selective=True),
             )
             return
-        goal, is_primary = self._pm.add_goal(title, cadence)
+
+        parent, children, is_primary = self._pm.add_goal_tree(parsed)
+        await self._announce_goal(update, ctx, parent, children, is_primary)
+
+    async def _goal_format_hint(self, update) -> None:
+        await update.message.reply_text(
+            "直接说人话就行：做什么 + 多久催你一次。\n"
+            "例：我要每天晚上八点前交健身打卡。\n"
+            "要拆步骤：重构登录，先写接口再接前端最后联调。\n"
+            "老格式也认：写完登录页 | 每天20:00。\n"
+            "目标要小到今天就能出体。"
+        )
+
+    async def _announce_goal(self, update, ctx, goal, children, is_primary: bool) -> None:
+        """落库后统一回执 + 重挂催收。children 非空则列出子目标。"""
         _, desc = parse_cadence(goal.cadence)
         self._reschedule_primary(ctx.application)
         tag = "【当下主攻】" if is_primary else "（排队中，不催；用 /primary 提为主攻）"
-        await update.message.reply_text(
-            f"记下了。#{goal.id} {goal.title} {tag}\n催收：{desc}\n到点我会来要东西。"
-        )
+        lines = [f"记下了。#{goal.id} {goal.title} {tag}"]
+        if children:
+            lines.append("拆成：")
+            lines.extend(f"  {i}. {c.title}" for i, c in enumerate(children, 1))
+            lines.append(f"催收：{desc}（先盯第一步：{children[0].title}）")
+        else:
+            lines.append(f"催收：{desc}")
+        lines.append("到点我会来要东西。")
+        await update.message.reply_text("\n".join(lines))
 
     async def _on_primary(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update):
@@ -261,6 +310,14 @@ class SupervisorBot:
             _, desc = parse_cadence(g.cadence)
             star = "★主攻" if g.is_primary else "  排队"
             lines.append(f"#{g.id} [{star}] {g.title}  ({desc})")
+            # 有子目标就缩进列出，标出当前活跃那步
+            children = self._db.list_children(g.id)
+            if children:
+                active = self._db.get_active_child(g.id)
+                for c in children:
+                    mark = "▶" if (active and c.id == active.id) else (
+                        "✓" if c.status.value == "done" else "·")
+                    lines.append(f"      {mark} #{c.id} {c.title}")
         await update.message.reply_text("\n".join(lines))
 
     async def _on_done(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -304,11 +361,12 @@ class SupervisorBot:
     async def _on_nagnow(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update):
             return
-        primary = self._pm.get_primary()
-        if not primary:
+        target = self._pm.get_nag_target()
+        if target is None:
             await update.message.reply_text(self._pm.no_primary_text())
             return
-        await update.message.reply_text(self._pm.nag_text(primary))
+        primary, active_child = target
+        await update.message.reply_text(self._pm.nag_text(primary, active_child))
 
     async def _on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update):
@@ -332,10 +390,13 @@ class SupervisorBot:
             await self._do_change(update, ctx, text)
             return
 
-        primary = self._pm.get_primary()
-        if not primary:
+        target = self._pm.get_nag_target()
+        if target is None:
             await update.message.reply_text(self._pm.no_primary_text())
             return
+        primary, active_child = target
+        # 交货/审查落到"当前该盯的那个"：有活跃子目标就是子目标，否则是大目标本身。
+        review_goal = active_child or primary
 
         # 拦改：先看你是不是想改目标定义（善变的老板）。是 → 硬拦，指向正门。
         wants_change = await _run_intent(self._llm, text)
@@ -343,14 +404,14 @@ class SupervisorBot:
             await update.message.reply_text(
                 "这不在锁定的需求里。想改目标？走正门：\n"
                 f"  /change 新目标\n"
-                f"随口在这改，我不认。现在盯的还是：「{primary.title}」。东西呢？"
+                f"随口在这改，我不认。现在盯的还是：「{review_goal.title}」。东西呢？"
             )
             return
 
         # 否则一律当"交货尝试"送审查官 —— 审查官自己会戳穿空话。
-        await update.message.reply_text(f"收货，审「{primary.title}」……")
+        await update.message.reply_text(f"收货，审「{review_goal.title}」……")
         _verdict, _issues, reply = await _run_review(
-            self._reviewer, primary, text
+            self._reviewer, review_goal, text
         )
         await update.message.reply_text(reply)
 
@@ -373,6 +434,14 @@ async def _run_intent(llm, text: str) -> bool:
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, is_change_goal_intent, llm, text)
+
+
+async def _run_parse(llm, text: str):
+    """自然语言目标解析也调 LLM，丢线程池，不卡事件循环。"""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, parse_goal_nl, llm, text)
 
 
 def _split_goal(raw: str) -> tuple[str, str]:

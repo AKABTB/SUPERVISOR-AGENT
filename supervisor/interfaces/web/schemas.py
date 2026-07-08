@@ -18,6 +18,9 @@ class GoalOut(BaseModel):
     cadence_desc: str      # parse_cadence 的人类可读说明
     created_at: str
     deadline: str | None = None
+    parent_id: int | None = None
+    children: list["GoalOut"] = []      # 子目标（仅顶层目标会填）
+    active_child_id: int | None = None  # 当前活跃子目标 id（催收落到它）
 
 
 class PrimaryOut(BaseModel):

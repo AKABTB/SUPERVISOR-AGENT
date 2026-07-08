@@ -116,6 +116,17 @@ onMounted(load)
       <div class="primary" v-if="primary">
         <span class="lbl">当下主攻 #{{ primary.goal.id }}</span>
         <div class="title">{{ primary.goal.title }}</div>
+        <div class="subs" v-if="primary.goal.children && primary.goal.children.length">
+          <div class="sub" v-for="c in primary.goal.children" :key="c.id"
+               :class="{ active: c.id === primary.goal.active_child_id, done: c.status === 'done' }">
+            <span class="mk">{{ c.status === 'done' ? '✓' : (c.id === primary.goal.active_child_id ? '▶' : '·') }}</span>
+            <span class="st">#{{ c.id }} {{ c.title }}</span>
+            <span class="rowacts" v-if="c.status !== 'done'">
+              <button class="b sm" @click="markDone(c.id)">交掉这步</button>
+            </span>
+          </div>
+          <div class="hint">只催带 ▶ 的当前这步。交掉一步自动推进到下一步。</div>
+        </div>
         <div class="meta">
           <span>cadence=<b>{{ primary.goal.cadence_desc }}</b></span>
           <span>nagged=<b>{{ primary.nagged }}</b></span>
@@ -140,7 +151,7 @@ onMounted(load)
       <div v-if="queue.length">
         <div class="g" v-for="g in queue" :key="g.id">
           <span class="id">#{{ g.id }}</span>
-          <span class="t">{{ g.title }}</span>
+          <span class="t">{{ g.title }}<span class="subcount" v-if="g.children && g.children.length"> · {{ g.children.length }}步</span></span>
           <span class="badge q">排队</span>
           <span class="cad">{{ g.cadence_desc }}</span>
           <span class="rowacts">

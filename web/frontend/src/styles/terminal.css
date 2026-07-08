@@ -75,6 +75,23 @@ body {
 .primary .meta b { color: var(--ink); }
 .primary .acts { margin-top: 16px; display: flex; gap: 0; flex-wrap: wrap; }
 
+/* 子目标（里程碑）列表 —— 主攻块内缩进 */
+.primary .subs {
+  margin: 0 0 12px; padding: 10px 0 4px 2px;
+  border-top: 1px dotted var(--faint); border-bottom: 1px dotted var(--faint);
+}
+.primary .sub {
+  display: flex; align-items: baseline; gap: 10px;
+  font-size: 14px; padding: 4px 0; color: var(--muted);
+}
+.primary .sub .mk { min-width: 14px; color: var(--muted); }
+.primary .sub.active { color: var(--ink); font-weight: 600; }
+.primary .sub.active .mk { color: var(--amber); }
+.primary .sub.done { color: var(--faint); text-decoration: line-through; }
+.primary .sub .rowacts { margin-left: auto; }
+.primary .subs .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.subcount { color: var(--muted); font-size: 12px; }
+
 .empty {
   border: 1px dashed var(--faint); padding: 18px 20px;
   color: var(--muted); font-size: 14px; background: #fff;

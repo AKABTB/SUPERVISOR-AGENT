@@ -41,8 +41,17 @@ def _bot_configured(request: Request) -> bool:
 
 # ---- 序列化助手 ----
 
-def _goal_out(goal) -> GoalOut:
+def _goal_out(goal, db: Database | None = None) -> GoalOut:
     _, desc = parse_cadence(goal.cadence)
+    children: list[GoalOut] = []
+    active_child_id: int | None = None
+    # 只有顶层目标（parent_id 为空）才展开子目标，避免递归查库。
+    if db is not None and goal.parent_id is None:
+        kids = db.list_children(goal.id)
+        if kids:
+            children = [_goal_out(k) for k in kids]
+            active = db.get_active_child(goal.id)
+            active_child_id = active.id if active else None
     return GoalOut(
         id=goal.id,
         title=goal.title,
@@ -52,6 +61,9 @@ def _goal_out(goal) -> GoalOut:
         cadence_desc=desc,
         created_at=goal.created_at,
         deadline=goal.deadline,
+        parent_id=goal.parent_id,
+        children=children,
+        active_child_id=active_child_id,
     )
 
 
@@ -79,14 +91,14 @@ def overview(request: Request) -> OverviewOut:
         nagged, delivered = db.goal_counters(primary.id)
         lv = db.last_verdict(primary.id)
         primary_out = PrimaryOut(
-            goal=_goal_out(primary),
+            goal=_goal_out(primary, db),
             nagged=nagged,
             delivered=delivered,
             last_verdict=lv.value if lv else None,
         )
 
     queue = [
-        _goal_out(g)
+        _goal_out(g, db)
         for g in db.list_goals(status=GoalStatus.ACTIVE)
         if not g.is_primary
     ]
@@ -150,7 +162,7 @@ def _delivery_text(d) -> str:
 def list_goals(request: Request, status: str | None = None) -> list[GoalOut]:
     db = _db(request)
     st = GoalStatus(status) if status else None
-    return [_goal_out(g) for g in db.list_goals(status=st)]
+    return [_goal_out(g, db) for g in db.list_goals(status=st)]
 
 
 @router.post("/goals", response_model=GoalOut)

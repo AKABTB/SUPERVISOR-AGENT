@@ -26,14 +26,19 @@ class CountedAs(str, Enum):
 
 @dataclass
 class Goal:
-    """目标 / 项目。要求：小到'今天能出体'。"""
+    """目标 / 项目。要求：小到'今天能出体'。
+
+    parent_id 为空 = 顶层大目标（可当主攻）；非空 = 某大目标下的子目标/里程碑。
+    子目标不单独催、不单独当主攻——催收落到"主攻大目标下当前活跃的子目标"。
+    """
     id: int | None
     title: str
-    is_primary: bool          # 是否当下主攻（全局至多一个 True）
+    is_primary: bool          # 是否当下主攻（全局至多一个 True，仅顶层目标可为 True）
     status: GoalStatus
     cadence: str              # 催收频率，如 "每天20:00"
     created_at: str
     deadline: str | None = None
+    parent_id: int | None = None    # None=顶层大目标；非空=子目标，挂在该 id 大目标下
 
 
 @dataclass

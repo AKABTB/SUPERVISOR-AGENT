@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS goals (
     status      TEXT NOT NULL DEFAULT 'active',
     cadence     TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL,
-    deadline    TEXT
+    deadline    TEXT,
+    parent_id   INTEGER REFERENCES goals(id)
 );
 
 CREATE TABLE IF NOT EXISTS delivery_logs (
@@ -66,18 +67,29 @@ class Database:
     def _init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn) -> None:
+        """幂等迁移。老库（无 parent_id 列）自动补列，不炸现有 data.db。
+        Bot 和 Web 两进程共用一份库，两边都会走这里，必须能反复安全执行。"""
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(goals);").fetchall()}
+        if "parent_id" not in cols:
+            conn.execute("ALTER TABLE goals ADD COLUMN parent_id INTEGER REFERENCES goals(id);")
 
     # ---- Goal ----
 
     def add_goal(self, title: str, cadence: str, created_at: str,
-                 is_primary: bool = False, deadline: str | None = None) -> int:
+                 is_primary: bool = False, deadline: str | None = None,
+                 parent_id: int | None = None) -> int:
         with self._conn() as conn:
             if is_primary:
                 conn.execute("UPDATE goals SET is_primary = 0 WHERE is_primary = 1;")
             cur = conn.execute(
-                "INSERT INTO goals (title, is_primary, status, cadence, created_at, deadline) "
-                "VALUES (?, ?, ?, ?, ?, ?);",
-                (title, int(is_primary), GoalStatus.ACTIVE.value, cadence, created_at, deadline),
+                "INSERT INTO goals (title, is_primary, status, cadence, created_at, deadline, parent_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?);",
+                (title, int(is_primary), GoalStatus.ACTIVE.value, cadence, created_at,
+                 deadline, parent_id),
             )
             return int(cur.lastrowid)
 
@@ -94,17 +106,22 @@ class Database:
             ).fetchone()
             return _row_to_goal(row) if row else None
 
-    def list_goals(self, status: GoalStatus | None = None) -> list[Goal]:
+    def list_goals(self, status: GoalStatus | None = None,
+                   top_level_only: bool = True) -> list[Goal]:
+        """默认只列顶层大目标（parent_id IS NULL）——子目标不进目标列表/队列/主攻。
+        需要含子目标时传 top_level_only=False。"""
+        where = []
+        params: list = []
+        if status:
+            where.append("status = ?")
+            params.append(status.value)
+        if top_level_only:
+            where.append("parent_id IS NULL")
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
         with self._conn() as conn:
-            if status:
-                rows = conn.execute(
-                    "SELECT * FROM goals WHERE status = ? ORDER BY is_primary DESC, id;",
-                    (status.value,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM goals ORDER BY is_primary DESC, id;"
-                ).fetchall()
+            rows = conn.execute(
+                f"SELECT * FROM goals{clause} ORDER BY is_primary DESC, id;", params
+            ).fetchall()
             return [_row_to_goal(r) for r in rows]
 
     def set_goal_status(self, goal_id: int, status: GoalStatus) -> None:
@@ -131,6 +148,42 @@ class Database:
                 "SELECT * FROM goals WHERE id = ?;", (goal_id,)
             ).fetchone()
             return _row_to_goal(row) if row else None
+
+    # ---- 层级（父子目标） ----
+
+    def list_children(self, parent_id: int,
+                      status: GoalStatus | None = None) -> list[Goal]:
+        """列某大目标的子目标，按 id 升序（= 创建/推进顺序）。"""
+        with self._conn() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM goals WHERE parent_id = ? AND status = ? ORDER BY id;",
+                    (parent_id, status.value),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM goals WHERE parent_id = ? ORDER BY id;",
+                    (parent_id,),
+                ).fetchall()
+            return [_row_to_goal(r) for r in rows]
+
+    def get_active_child(self, parent_id: int) -> Goal | None:
+        """取该大目标下"当前活跃"的子目标 = 第一个 active 子（按 id）。
+        催收就落到它身上。无 active 子则返回 None（子全交完或本就没拆）。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM goals WHERE parent_id = ? AND status = 'active' "
+                "ORDER BY id LIMIT 1;",
+                (parent_id,),
+            ).fetchone()
+            return _row_to_goal(row) if row else None
+
+    def has_children(self, parent_id: int) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM goals WHERE parent_id = ? LIMIT 1;", (parent_id,)
+            ).fetchone()
+            return row is not None
 
     # ---- DeliveryLog ----
 
@@ -245,6 +298,7 @@ class Database:
 
 
 def _row_to_goal(row: sqlite3.Row) -> Goal:
+    keys = row.keys()
     return Goal(
         id=row["id"],
         title=row["title"],
@@ -253,6 +307,7 @@ def _row_to_goal(row: sqlite3.Row) -> Goal:
         cadence=row["cadence"],
         created_at=row["created_at"],
         deadline=row["deadline"],
+        parent_id=row["parent_id"] if "parent_id" in keys else None,
     )
 
 
